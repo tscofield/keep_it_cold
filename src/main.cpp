@@ -361,7 +361,7 @@ void setupWebServer() {
 
   server.on("/addnode", HTTP_POST, [](AsyncWebServerRequest *request){
     String newnode = request->getParam("newnode", true)->value();
-    if (newnode.length() == 6 && !nodeList.contains(newnode)) {
+    if (newnode.length() == 6 && nodeList.indexOf(newnode) == -1) {
       nodeList += "," + newnode;
       saveNodeList(nodeList);
       broadcastNodeList();

@@ -1,0 +1,24 @@
+# Ignore PlatformIO build and output folders
+.pio/
+.pioenvs/
+.pio/libdeps/
+.pio/build/
+
+# Ignore PlatformIO IDE settings
+.vscode/
+.idea/
+
+# Ignore local library clones
+lib/ESPAsyncWebServer/
+lib/AsyncTCP/
+
+# Ignore OS-specific files
+*.DS_Store
+Thumbs.db
+
+# Ignore compiled binaries
+*.bin
+*.elf
+
+# Ignore backup files
+*~

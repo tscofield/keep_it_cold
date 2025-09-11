@@ -25,7 +25,6 @@ by @tscofield
 
 ## Wiring Diagram
 
-See [`docs/wiring.svg`](docs/wiring.svg)
 
 ### Pin Connections (default, see `main.cpp`)
 | ESP32 Pin | Device     | Function      |
@@ -35,6 +34,33 @@ See [`docs/wiring.svg`](docs/wiring.svg)
 | 22        | OLED SCL   | I2C Clock     |
 | 32        | Buzzer     | Alarm         |
 | 5,19,27,18,14,26 | LoRa | SPI + Control |
+
+            +3.3V
+              |
+       .------------------------------.
+       |            ESP32 Module      |
+       |------------------------------|
+       |        [integrated LoRa/OLED]|
+       |                              |
+       |    GPIO21 (SDA) ------------+----> OLED SDA
+       |    GPIO22 (SCL) ------------+----> OLED SCL
+       |                              |
+       |    GPIO5 (SCK) --------------+----> LoRa SCK
+       |    GPIO19 (MISO) ------------+----> LoRa MISO
+       |    GPIO27 (MOSI) ------------+----> LoRa MOSI
+       |    GPIO18 (NSS) -------------+----> LoRa NSS
+       |    GPIO14 (RST) -------------+----> LoRa RST
+       |    GPIO26 (DIO0) ------------+----> LoRa DIO0
+       |                              |
+       |    GPIO17 -------------------+----> DS18B20 DATA
+       |                              |
+       |    GPIO32 -------------------+----> Buzzer +
+       |                              |
+       |    GND ----------------------+----> All GND pins
+       '------------------------------'
+              |         |           |
+         DS18B20     OLED/LoRa   Buzzer
+         (VCC/GND)   (VCC/GND)   (GND)
 
 ## Setup
 

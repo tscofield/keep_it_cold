@@ -13,37 +13,42 @@
 */
 
 #include <WiFi.h>
+//#include <WiFiManager.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <LoRa.h>
+#include <SPI.h>
 #include <Wire.h>
+#include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <vector>
 
 // ----- Pin Definitions -----
-#define OLED_SDA   21
-#define OLED_SCL   22
-#define OLED_RESET -1
-#define DS18B20_PIN 17
+#define OLED_RESET 21
+#define DS18B20_PIN 33
 #define BUZZER_PIN 32
 
-#define LORA_SCK   5
-#define LORA_MISO  19
-#define LORA_MOSI  27
-#define LORA_SS    18
-#define LORA_RST   14
+#define LORA_SCK   9
+#define LORA_MISO  11
+#define LORA_MOSI  10
+#define LORA_SS    8
+#define LORA_RST   12
 #define LORA_DIO0  26
 #define LORA_FREQ  915E6 // adjust for region
 
 // ----- Hardware -----
-Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
+TwoWire twi = TwoWire(1);
+Adafruit_SSD1306 display(128, 64, &twi, OLED_RESET);
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature sensors(&oneWire);
 Preferences preferences;
 AsyncWebServer server(80);
+//WiFiManager wifiManager;
+DNSServer dnsServer;
 
 // ----- Node Data -----
 struct NodeTemp {
@@ -54,7 +59,7 @@ struct NodeTemp {
 std::vector<NodeTemp> nodeTemps;
 String nodeID;
 String nodeList; // Comma-separated
-String wifiSSID = "ESP32Probe";
+String wifiSSID = "";
 String wifiPASS = "";
 float myTemp = NAN;
 String lastLoRaStatus = "OK";
@@ -156,7 +161,7 @@ std::vector<String> getNodeIDs() {
 // ----- WiFi/NodeID Config -----
 String getDefaultNodeID() {
   uint8_t mac[6];
-  WiFi.macAddress(mac);
+  //WiFi.macAddress(mac);
   char nodeid[7];
   sprintf(nodeid, "%02X%02X%02X", mac[3], mac[4], mac[5]);
   return String(nodeid);
@@ -164,7 +169,7 @@ String getDefaultNodeID() {
 void loadConfig() {
   preferences.begin("probe", false);
   nodeID = preferences.getString("nodeid", "");
-  wifiSSID = preferences.getString("ssid", wifiSSID);
+  wifiSSID = preferences.getString("ssid", "");
   wifiPASS = preferences.getString("pass", "");
   preferences.end();
   if (nodeID == "" || nodeID.length() != 6) {
@@ -173,8 +178,15 @@ void loadConfig() {
     preferences.putString("nodeid", nodeID);
     preferences.end();
   }
-  if (wifiPASS == "" || wifiPASS.length() < 6) {
-    wifiPASS = nodeID;
+  if (wifiSSID == "") {
+    wifiSSID = "KIC-" + nodeID;
+    preferences.begin("probe", false);
+    preferences.putString("ssid", wifiSSID);
+    preferences.end();
+  } 
+  
+  if (wifiPASS == "" || wifiPASS.length() < 8) {
+    wifiPASS = "KeepItCold";
     preferences.begin("probe", false);
     preferences.putString("pass", wifiPASS);
     preferences.end();
@@ -202,13 +214,18 @@ void saveWiFi(const String& ssid, const String& pass) {
 
 // ----- LoRa -----
 void setupLoRa() {
+  Serial.println("SPI begin");
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  Serial.println("LoRa setPins");
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  Serial.println("LoRa begin");
   if (!LoRa.begin(LORA_FREQ)) {
     lastLoRaStatus = "LoRa init failed";
   } else {
     lastLoRaStatus = "LoRa OK";
   }
+  Serial.println("LoRa setup done");
+  Serial.println(lastLoRaStatus);
 }
 void broadcastHeartbeat() {
   LoRa.beginPacket();
@@ -291,8 +308,9 @@ void showOLED() {
 }
 
 // ----- Web Server -----
-void setupWebServer() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+void WebServerRoot(AsyncWebServerRequest *request){
+  /*
+    //String newID = request->getParam("nodeid", true)->value();
     updateWebCheckin();
     String html = "<h2>Keep It Cold Node</h2>";
     html += "<p>NodeID: <b>" + nodeID + "</b></p>";
@@ -314,8 +332,23 @@ void setupWebServer() {
     }
     html += "</ul>";
     html += "<p>REST API: <a href='/api/temps'>/api/temps</a></p>";
+  */
+    String html = "<!DOCTYPE html><html><head><title>Keep It Cold Node</title></head><body>";
+    html += "<h2>Keep It Cold Node</h2>";
     request->send(200, "text/html", html);
+}
+void setupWebServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->redirect("/brr");
   });
+
+  // critical for captave portal to work
+  // redirect all not-found to /brr
+  server.onNotFound([](AsyncWebServerRequest *request){
+    request->redirect("/brr");
+  });
+
+  server.on("/brr", HTTP_GET, WebServerRoot);
 
   server.on("/setnodeid", HTTP_POST, [](AsyncWebServerRequest *request){
     String newID = request->getParam("nodeid", true)->value();
@@ -382,36 +415,93 @@ void setupWebServer() {
   server.begin();
 }
 
+//void bindServerCallback() {
+//  // wifiManager.server is a pointer to WebServer
+//  wifiManager.server->on("/", []() {
+//    //wifiManager.server->send(200, "text/html", "<h1>My Root Page</h1>");
+//    wifiManager.server->sendHeader("Location", "/brr");
+//    wifiManager.server->send(301);
+//  });
+//}
+
 // ----- Setup & Main Loop -----
 void setup() {
-  Wire.begin(OLED_SDA, OLED_SCL);
+  Serial.begin(115200);
+  Serial.println("Keep It Cold Node Starting...");
+
+  // OLED power control (Heltec Vext pin)
+  pinMode(Vext, OUTPUT);
+  digitalWrite(Vext, LOW);
+  // Heltec delays for 100ms in their example
+  delay(100);
+
+
+  twi.begin(SDA_OLED, SCL_OLED);
+  
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("OLED display not found!"));
+    while (true); // Stop here if display is not found
+  }
+  //display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  //display.begin();
   display.clearDisplay();
   display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+  //display.setTextColor(SSD1306_WHITE);
+  display.setTextColor(WHITE);
+  display.setCursor(0,0);
+  display.println("Keep It Cold");
+  display.display();
 
-  Serial.begin(115200);
   loadConfig();
   loadNodeList();
   loadTime();
   loadSilence();
   loadLastWebCheckin();
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 20) { delay(500); tries++; }
+  Serial.println("NodeID: " + nodeID);
+  Serial.println("WiFi SSID: " + wifiSSID + " PASS: " + wifiPASS);
+  Serial.println("Node List: " + nodeList);
+  Serial.println("Stored Time: " + getTimeString());
+  Serial.println("Silence Until: " + String(silenceUntil) + " Last Web Checkin: " + String(lastWebCheckin));
+  showOLED();
 
+  Serial.println("Starting WiFi AP...");
+  //wifiManager.autoConnect(wifiSSID.c_str(), wifiPASS.c_str());
+  //wifiManager.setWebServerCallback(bindServerCallback);
+//  wifiManager.setAPServerCallback(bindServerCallback);
+
+  //wifiManager.setWebServerCallback(bindServerCallback);
+//  wifiManager.startConfigPortal(wifiSSID.c_str(), wifiPASS.c_str());
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(wifiSSID.c_str(), wifiPASS.c_str());
+  //WiFi.softAP(wifiSSID.c_str());
+  delay(500); // Wait for AP to start
+  Serial.println("AP IP address: " + WiFi.softAPIP().toString());
+
+  Serial.println("Starting LoRa...");
   setupLoRa();
+  Serial.println("Starting sensors...");
   sensors.begin();
+  Serial.println("Starting web server...");
   setupWebServer();
 
+  Serial.println("Starting DNS server...");
+  dnsServer.start(53, "*", WiFi.softAPIP());
+
+  Serial.println("Update own temp...");
   updateNodeTemp(nodeID, NAN); // Add self to nodeTemps
+
+  Serial.println("Setup complete.");
 }
 
 unsigned long lastSend = 0, lastRead = 0, lastHeartbeat = 0;
 
 void loop() {
+
+  //process DNS requests
+  dnsServer.processNextRequest();
+
   // Serial config (for debugging/config)
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
@@ -447,10 +537,15 @@ void loop() {
     }
   }
 
+  bool tempprobedisconnected = false;
   // Read DS18B20 every 5s
   if (millis() - lastRead > 5000) {
     sensors.requestTemperatures();
     myTemp = sensors.getTempCByIndex(0);
+    if (myTemp == DEVICE_DISCONNECTED_C) {
+      myTemp = NAN;
+      tempprobedisconnected = true;
+    }
     updateNodeTemp(nodeID, myTemp);
     lastRead = millis();
     showOLED();
@@ -494,11 +589,22 @@ void loop() {
       if (isDaytime()) buzzAlarm();
     }
   }
+  // Temp probe disconnected alarm
+  if (tempprobedisconnected && !silenceActive) {
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.println("ALARM! Temp Probe");
+    display.println("Disconnected!");
+    if (isDaytime()) buzzAlarm();
+  }
+/*
   if (!silenceActive && noWebCheckin) {
     display.clearDisplay();
     display.setCursor(0,0);
     display.println("CHECKIN ALARM!");
+    display.println("Connect to WiFi: " + wifiSSID);
     display.display();
     if (isDaytime()) buzzAlarm();
   }
+*/
 }

@@ -18,7 +18,8 @@
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
-#include <LoRa.h>
+//#include <LoRa.h>
+#include <RadioLib.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -26,6 +27,11 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <vector>
+#include <Wire.h>
+//#include <RTClib.h>
+#include <TimeLib.h>
+#include <DS3231.h>
+#include <LittleFS.h>
 
 // ----- Pin Definitions -----
 #define OLED_RESET 21
@@ -37,7 +43,8 @@
 #define LORA_MOSI  10
 #define LORA_SS    8
 #define LORA_RST   12
-#define LORA_DIO0  26
+#define LORA_BUSY  13
+#define LORA_DIO0  14
 #define LORA_FREQ  915E6 // adjust for region
 
 // ----- Hardware -----
@@ -49,12 +56,17 @@ Preferences preferences;
 AsyncWebServer server(80);
 //WiFiManager wifiManager;
 DNSServer dnsServer;
+DS3231 rtc;
+
 
 // ----- Node Data -----
 struct NodeTemp {
   String id;
-  float temp;
-  unsigned long lastUpdate;
+  float temp1;
+  float temp2;
+  float temp3;
+  time_t lastUpdate;
+  bool hasrtc;
 };
 std::vector<NodeTemp> nodeTemps;
 String nodeID;
@@ -62,30 +74,32 @@ String nodeList; // Comma-separated
 String wifiSSID = "";
 String wifiPASS = "";
 float myTemp = NAN;
-String lastLoRaStatus = "OK";
+int16_t lastLoRaStatus = 0;
+volatile bool loraPacketReceived = false;
+String loraBuffer= "";
+bool doIhaveRTC = false;
+bool needTime = false;
+const char* logFile = "/templog.csv"; // CSV: epoch,temp
+unsigned long lastLog = 0;
+//const unsigned long logInterval = 15UL * 60UL * 1000UL; // 15 minutes in millis
+
+
+// Create the radio object (Module: NSS, IRQ(DIO1), RST, BUSY)
+Module myModule(LORA_SS, LORA_DIO0, LORA_RST, LORA_BUSY);
+SX1262 radio = SX1262(&myModule);
+
 
 // ----- Timekeeping -----
 unsigned long storedEpoch = 0;    // seconds since epoch
 unsigned long storedMillis = 0;   // millis() when time was set
-void loadTime() {
-  preferences.begin("probe", false);
-  storedEpoch = preferences.getULong("epoch", 0);
-  storedMillis = preferences.getULong("epochMillis", 0);
-  preferences.end();
-}
-void saveTime(unsigned long epoch) {
-  preferences.begin("probe", false);
-  preferences.putULong("epoch", epoch);
-  preferences.putULong("epochMillis", millis());
-  preferences.end();
-  storedEpoch = epoch;
-  storedMillis = millis();
-}
+time_t nextLog = 0;
+
+
 struct tm getLocalTime() {
-  unsigned long secondsSinceSet = (millis() - storedMillis) / 1000;
-  time_t now = storedEpoch + secondsSinceSet;
+  //unsigned long secondsSinceSet = (millis() - storedMillis) / 1000;
+  time_t tnow = now();
   struct tm t;
-  localtime_r(&now, &t);
+  localtime_r(&tnow, &t);
   return t;
 }
 bool isDaytime() {
@@ -134,6 +148,15 @@ void buzzAlarm() {
 }
 
 // ----- Node List Management -----
+NodeTemp* findNodeById(const String &id) {
+  for (auto &node : nodeTemps) {
+    if (node.id == id) {
+      return &node;  // return pointer to the entry
+    }
+  }
+  return nullptr;  // not found
+}
+
 void loadNodeList() {
   preferences.begin("probe", false);
   nodeList = preferences.getString("nodelist", "");
@@ -213,59 +236,133 @@ void saveWiFi(const String& ssid, const String& pass) {
 }
 
 // ----- LoRa -----
+void setLoraFlag(void) {
+  loraPacketReceived = true;
+}
+
 void setupLoRa() {
   Serial.println("SPI begin");
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  Serial.println("LoRa setPins");
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  //SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
+//  Serial.println("LoRa setPins");
+//  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
   Serial.println("LoRa begin");
-  if (!LoRa.begin(LORA_FREQ)) {
-    lastLoRaStatus = "LoRa init failed";
+  lastLoRaStatus = radio.begin(915.0);
+
+  if (lastLoRaStatus == RADIOLIB_ERR_NONE) {
+    Serial.println("LoRa init OK");
   } else {
-    lastLoRaStatus = "LoRa OK";
+    Serial.print("LoRa init failed: ");
+    Serial.println(lastLoRaStatus);
   }
+  radio.setOutputPower(13);
+  
   Serial.println("LoRa setup done");
-  Serial.println(lastLoRaStatus);
+//  Serial.println(lastLoRaStatus);
+
+  // attach call back
+  radio.setDio1Action(setLoraFlag);
+  int16_t state = radio.startReceive();
+  if (state == RADIOLIB_ERR_NONE) { 
+    Serial.println("LoRa RX started");
+  } else {
+    Serial.print("LoRa RX failed, code ");
+    Serial.println(state);
+  } 
 }
+
 void broadcastHeartbeat() {
-  LoRa.beginPacket();
-  LoRa.print(nodeID);
-  LoRa.print(",HEARTBEAT,");
-  LoRa.print((millis()/1000));
-  LoRa.endPacket();
+  String msg = nodeID + ",HEARTBEAT," + String(millis() / 1000);
+  int16_t state = radio.transmit(msg);
+  if(state == RADIOLIB_ERR_NONE){
+    Serial.println("Heartbeat sent: " + msg);
+  } else {
+    Serial.print("Heartbeat failed, code: ");
+    Serial.println(state);
+  }
 }
+
 void broadcastTemperature(float temp) {
-  LoRa.beginPacket();
-  LoRa.print(nodeID);
-  LoRa.print(",TEMP,");
-  LoRa.print(temp, 2);
-  LoRa.endPacket();
+  String msg = nodeID + ",TEMP," + String(temp, 2);
+  int16_t state = radio.transmit(msg);
+  if(state == RADIOLIB_ERR_NONE){
+    Serial.println("Temperature sent: " + msg);
+  } else {
+    Serial.print("Temperature failed, code: ");
+    Serial.println(state);
+  }
 }
+//void broadcastStruct() {
+//  int16_t state = radio.transmit((uint8_t*)&myTemp, sizeof(myTemp));
+//  if(state == RADIOLIB_ERR_NONE){
+//    Serial.println("Struct sent");
+//  } else {
+//    Serial.print("Struct failed, code: ");
+//    Serial.println(state);
+//  }
+//}
+
 void broadcastNodeList() {
-  LoRa.beginPacket();
-  LoRa.print("NODELIST,");
-  LoRa.print(nodeList);
-  LoRa.endPacket();
+  String msg = "NODELIST," + nodeList;
+  int16_t state = radio.transmit(msg);
+  if(state == RADIOLIB_ERR_NONE){
+    Serial.println("Node list sent: " + msg);
+  } else {
+    Serial.print("Node list failed, code: ");
+    Serial.println(state);
+  }
 }
+
 void broadcastAlarm(const String& downNodeID) {
-  LoRa.beginPacket();
-  LoRa.print(nodeID);
-  LoRa.print(",ALARM,");
-  LoRa.print(downNodeID);
-  LoRa.endPacket();
+  String msg = nodeID + ",ALARM," + downNodeID;
+  int16_t state = radio.transmit(msg);
+  if(state == RADIOLIB_ERR_NONE){
+    Serial.println("Alarm sent: " + msg);
+  } else {
+    Serial.print("Alarm failed, code: ");
+    Serial.println(state);
+  }
 }
-void updateNodeTemp(String id, float temp) {
-  unsigned long now = millis();
+
+void broadcastKIC() {
+  NodeTemp* nt = findNodeById(nodeID);
+  if (!nt) return;   // safety check
+
+  String msg = "KIC," +
+               nt->id + "," +
+               String(nt->temp1, 2) + "," +
+               String(nt->temp2, 2) + "," +
+               String(nt->temp3, 2) + "," +
+               String((unsigned long)nt->lastUpdate) + "," +
+               String(nt->hasrtc ? 1 : 0);
+  
+  int16_t state = radio.transmit(msg);
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println("NodeTemp sent: " + msg);
+  } else {
+    Serial.print("Send failed: ");
+    Serial.println(state);
+  }
+
+  // Ensure we always go back into RX mode
+  radio.startReceive();
+}
+
+void updateNodeTemp(String id, float temp, float temp2, float temp3, bool hasRTC) {
   for (auto& n : nodeTemps) {
     if (n.id == id) {
-      n.temp = temp;
-      n.lastUpdate = now;
+      n.temp1 = temp;
+      n.temp2 = temp2;
+      n.temp3 = temp3;
+      n.lastUpdate = now();
+      n.hasrtc = hasRTC;
       return;
     }
   }
-  NodeTemp nt = {id, temp, now};
+  NodeTemp nt = {id, temp, temp2, temp3, now(), hasRTC};
   nodeTemps.push_back(nt);
 }
+
 void handleLoRaPacket(String incoming) {
   if (incoming.startsWith("NODELIST,")) {
     String newList = incoming.substring(9);
@@ -277,13 +374,61 @@ void handleLoRaPacket(String incoming) {
     int idx2 = incoming.indexOf(",TEMP,");
     String peerID = incoming.substring(0, idx1);
     float temp = incoming.substring(idx2 + 6).toFloat();
-    updateNodeTemp(peerID, temp);
+//    updateNodeTemp(peerID, temp);
   } else if (incoming.indexOf(",HEARTBEAT,") > 0) {
     int idx1 = incoming.indexOf(",");
     String peerID = incoming.substring(0, idx1);
-    updateNodeTemp(peerID, NAN); // update heartbeat timestamp only
+//    updateNodeTemp(peerID, NAN); // update heartbeat timestamp only
   } else if (incoming.indexOf(",ALARM,") > 0) {
     // Optionally handle remote alarms
+  } else if (incoming.startsWith("KIC,")) {
+    // parse node temp struct
+    int idx1 = incoming.indexOf(",", 4);
+    if (idx1 < 0) return;
+    int idx2 = incoming.indexOf(",", idx1 + 1);
+    if (idx2 < 0) return;
+    int idx3 = incoming.indexOf(",", idx2 + 1);
+    if (idx3 < 0) return;
+    int idx4 = incoming.indexOf(",", idx3 + 1);
+    if (idx4 < 0) return;
+    int idx5 = incoming.indexOf(",", idx4 + 1);
+    if (idx5 < 0) return;
+    String peerID = incoming.substring(4, idx1);
+    float temp1 = incoming.substring(idx1 + 1, idx2).toFloat();
+    float temp2 = incoming.substring(idx2 + 1, idx3).toFloat();
+    float temp3 = incoming.substring(idx3 + 1, idx4).toFloat();
+    unsigned long lu = incoming.substring(idx4 + 1, idx5).toInt();
+    bool hasrtc = incoming.substring(idx5 + 1).toInt() != 0;
+    // ignoe the local node for updateing data
+    if (peerID == nodeID) {
+      Serial.println("Ignoring my own KIC msg");
+      return;
+    }
+    // update existing node entry
+    for (auto& n : nodeTemps) {
+      if (n.id == peerID) {
+        n.temp1 = temp1;
+        n.temp2 = temp2;
+        n.temp3 = temp3;
+        n.lastUpdate = lu;
+        n.hasrtc = hasrtc;
+        return;
+      }
+    }
+    // creata new node entry
+    NodeTemp nt = {peerID, temp1, temp2, temp3, lu, hasrtc};
+    nodeTemps.push_back(nt);
+
+    // if a remote node has RTC and we don't, update time sync
+    if (peerID != nodeID && hasrtc && !doIhaveRTC && needTime) {
+      // update local time from lu
+      Serial.println("Updating local time from " + peerID + " to " + String(lu));
+      setTime((time_t)lu);
+
+      needTime = false;
+    }
+  } else {
+    Serial.println("Unknown LoRa msg: " + incoming);
   }
 }
 
@@ -300,7 +445,7 @@ void showOLED() {
   for (auto& n : nodeTemps) {
     display.setCursor(0, y);
     display.print(n.id); display.print(": ");
-    if (!isnan(n.temp)) display.print(n.temp,1); else display.print("-");
+    if (!isnan(n.temp1)) display.print(n.temp1,1); else display.print("-");
     display.print("C");
     y -= 8; if (y < 40) break;
   }
@@ -309,7 +454,6 @@ void showOLED() {
 
 // ----- Web Server -----
 void WebServerRoot(AsyncWebServerRequest *request){
-  /*
     //String newID = request->getParam("nodeid", true)->value();
     updateWebCheckin();
     String html = "<h2>Keep It Cold Node</h2>";
@@ -328,25 +472,37 @@ void WebServerRoot(AsyncWebServerRequest *request){
     // Temps
     html += "<h3>Node Temperatures</h3><ul>";
     for (auto& n : nodeTemps) {
-      html += "<li>" + n.id + ": " + (isnan(n.temp) ? String("-") : String(n.temp,2)) + " C</li>";
+      html += "<li>" + n.id + ": " + (isnan(n.temp1) ? String("-") : String(n.temp1,2)) + " C</li>";
     }
     html += "</ul>";
     html += "<p>REST API: <a href='/api/temps'>/api/temps</a></p>";
-  */
-    String html = "<!DOCTYPE html><html><head><title>Keep It Cold Node</title></head><body>";
-    html += "<h2>Keep It Cold Node</h2>";
+    html += "<p>Log File (CSV): <a href='/log'>/log</a></p>";
+  
+
+    //String html = "<!DOCTYPE html><html><head><title>Keep It Cold Node</title></head><body>";
+    //html += "<h2>Keep It Cold Node</h2>";
     request->send(200, "text/html", html);
 }
+
 void setupWebServer() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->redirect("/brr");
   });
 
-  // critical for captave portal to work
-  // redirect all not-found to /brr
-  server.onNotFound([](AsyncWebServerRequest *request){
-    request->redirect("/brr");
+  server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request){
+    String logfile = "/templog.csv";
+    if (LittleFS.exists(logFile)) {
+      File file = LittleFS.open(logFile, "r");
+      if (file) {
+        String content = file.readString();
+        file.close();
+        request->send(200, "text/csv", content);
+        return;
+      }
+    }
+    request->send(404, "text/plain", "Log file not found");
   });
+
 
   server.on("/brr", HTTP_GET, WebServerRoot);
 
@@ -388,7 +544,7 @@ void setupWebServer() {
     t.tm_min = min;
     t.tm_sec = 0;
     time_t epoch = mktime(&t);
-    saveTime(epoch);
+//    saveTime(epoch);
     request->redirect("/");
   });
 
@@ -397,7 +553,7 @@ void setupWebServer() {
     if (newnode.length() == 6 && nodeList.indexOf(newnode) == -1) {
       nodeList += "," + newnode;
       saveNodeList(nodeList);
-      broadcastNodeList();
+//      broadcastNodeList();
     }
     request->redirect("/");
   });
@@ -406,10 +562,16 @@ void setupWebServer() {
     String json = "[";
     for (size_t i = 0; i < nodeTemps.size(); i++) {
       if (i > 0) json += ",";
-      json += "{\"id\":\"" + nodeTemps[i].id + "\",\"temp\":" + String(nodeTemps[i].temp,2) + "}";
+      json += "{\"id\":\"" + nodeTemps[i].id + "\",\"temp\":" + String(nodeTemps[i].temp1,2) + "}";
     }
     json += "]";
     request->send(200, "application/json", json);
+  });
+
+  // critical for captave portal to work
+  // redirect all not-found to /brr
+  server.onNotFound([](AsyncWebServerRequest *request){
+    request->redirect("/brr");
   });
 
   server.begin();
@@ -423,6 +585,100 @@ void setupWebServer() {
 //    wifiManager.server->send(301);
 //  });
 //}
+
+// ----- Temperature Logging -----
+void setupLogFile() {
+  Serial.println("Mounting LittleFS...");
+  if(!LittleFS.begin(true)){
+    Serial.println("LittleFS Mount Failed");
+    while(1);
+  }
+  if (!LittleFS.exists(logFile)) {
+    File file = LittleFS.open(logFile, "w");
+    if (file) {
+      file.println("epoch,node,temp1,temp2,temp3");
+      file.close();
+    }
+  }
+}
+
+String timeAsYMDHMS(time_t t) {
+  char buf[25];
+  snprintf(buf, sizeof(buf), "%02d/%02d/%04d %02d:%02d:%02d",
+           month(t), day(t), year(t),
+           hour(t), minute(t), second(t));
+  return String(buf);
+}
+
+time_t nextLogEpoch() {
+  time_t t = now();  // current epoch in seconds
+  
+  struct tm tmNext;
+  localtime_r(&t, &tmNext);
+
+  int currentMin = tmNext.tm_min;
+
+  // Find the next quarter-hour (0, 15, 30, 45)
+  int nextQuarter = ((currentMin / 15) + 1) * 15;
+  if(nextQuarter >= 60) {
+    tmNext.tm_hour += 1;   // bump hour
+    tmNext.tm_min = 0;     // reset minutes
+  } else {
+    tmNext.tm_min = nextQuarter;
+  }
+  tmNext.tm_sec = 0;       // always align on the minute
+
+  // mktime() normalizes the struct (handles day, month, year rollover)
+  time_t nextEpoch = mktime(&tmNext);
+
+  // In case we're exactly on a boundary but seconds > 0, skip to the next
+  if(nextEpoch <= t) {
+    nextEpoch += 15 * 60;
+  }
+
+  return nextEpoch;
+}
+
+void logloop() {
+  time_t t = now();
+
+  // get t into month/day/year hour:min:sec format
+  String tstamp = timeAsYMDHMS(t);
+
+  if(nextLog == 0) {
+    nextLog = nextLogEpoch();
+    Serial.println("Next log at epoch: " + String(nextLog) + " (" + tstamp + ")");
+  }
+
+  if(t >= nextLog) {
+    Serial.println("Logging temperature at epoch: " + String(t) + " (" + tstamp + ")");  
+    // Read temperature
+    sensors.requestTemperatures();
+    float temp = sensors.getTempCByIndex(0);
+    if(temp == DEVICE_DISCONNECTED_C) temp = NAN;
+
+    // Append to LittleFS CSV
+    File f = LittleFS.open("/templog.csv", FILE_APPEND);
+    if(f){
+      // fora all the node data we have in nodeTemps
+      for (auto& n : nodeTemps) {
+        if (n.id == nodeID) {
+          // use myTemp for self entry
+          f.printf("%s,%s,%.2f,%.2f,%.2f\n", tstamp, n.id.c_str(), temp, n.temp2, n.temp3);
+        } else {
+          // use stored temps for other nodes
+          f.printf("%s,%s,%.2f,%.2f,%.2f\n", tstamp, n.id.c_str(), n.temp1, n.temp2, n.temp3);
+        }
+      }
+      f.close();
+      Serial.printf("Logged: %02d:%02d -> %.2f\n", hour(t), minute(t), temp);
+    }
+
+    // Schedule next log
+    nextLog = nextLogEpoch(); // next quarter-hour
+    Serial.println("Next log at epoch: " + String(nextLog) + " (" + String(year(nextLog)) + "-" + String(month(nextLog)) + "-" + String(day(nextLog)) + " " + String(hour(nextLog)) + ":" + String(minute(nextLog)) + ":" + String(second(nextLog)) + ")");
+  }
+}
 
 // ----- Setup & Main Loop -----
 void setup() {
@@ -453,9 +709,35 @@ void setup() {
   display.println("Keep It Cold");
   display.display();
 
+  // setup rtc
+  Wire.begin(42,41);
+  if (rtc.getSecond()> 60){
+    Serial.println("Couldn't find RTC");
+    Serial.println("we should ask one of the nodes for the time");
+    needTime = true;
+  } else {
+    doIhaveRTC = true;
+    bool h12, pm;
+    bool century = false;
+    setTime(
+      rtc.getHour(h12, pm),
+      rtc.getMinute(),
+      rtc.getSecond(),
+      rtc.getDate(),
+      rtc.getMonth(century),
+      2000 + rtc.getYear()
+    );
+  }
+  time_t epoch = now();
+  Serial.print("year: "); Serial.println(year(epoch));
+  Serial.print("month: "); Serial.println(month(epoch));
+  Serial.print("day: "); Serial.println(day(epoch));
+  Serial.print("hour: "); Serial.println(hour(epoch));
+  Serial.print("min: "); Serial.println(minute(epoch));
+  Serial.print("sec: "); Serial.println(second(epoch));
+
   loadConfig();
   loadNodeList();
-  loadTime();
   loadSilence();
   loadLastWebCheckin();
 
@@ -467,16 +749,10 @@ void setup() {
   showOLED();
 
   Serial.println("Starting WiFi AP...");
-  //wifiManager.autoConnect(wifiSSID.c_str(), wifiPASS.c_str());
-  //wifiManager.setWebServerCallback(bindServerCallback);
-//  wifiManager.setAPServerCallback(bindServerCallback);
-
-  //wifiManager.setWebServerCallback(bindServerCallback);
-//  wifiManager.startConfigPortal(wifiSSID.c_str(), wifiPASS.c_str());
   WiFi.mode(WIFI_AP);
   WiFi.softAP(wifiSSID.c_str(), wifiPASS.c_str());
   //WiFi.softAP(wifiSSID.c_str());
-  delay(500); // Wait for AP to start
+  delay(1000); // Wait for AP to start
   Serial.println("AP IP address: " + WiFi.softAPIP().toString());
 
   Serial.println("Starting LoRa...");
@@ -489,19 +765,67 @@ void setup() {
   Serial.println("Starting DNS server...");
   dnsServer.start(53, "*", WiFi.softAPIP());
 
+  // Mount LittleFS
+  setupLogFile();
+
   Serial.println("Update own temp...");
-  updateNodeTemp(nodeID, NAN); // Add self to nodeTemps
+  updateNodeTemp(nodeID, NAN, NAN, NAN, doIhaveRTC); // Add self to nodeTemps
 
   Serial.println("Setup complete.");
 }
 
 unsigned long lastSend = 0, lastRead = 0, lastHeartbeat = 0;
 
-void loop() {
+void radioloop() {
+  if (loraPacketReceived) {
+    loraPacketReceived = false;
+    String incoming = "";
+    int state = radio.readData(incoming);
 
-  //process DNS requests
-  dnsServer.processNextRequest();
+    if (state == RADIOLIB_ERR_NONE) {
+      // packet received successfully
+      Serial.println("Received: " + incoming);
+      Serial.println("Received length: " + String(incoming.length()));
+      handleLoRaPacket(incoming);
+    } else {
+      Serial.print("Receive failed, code: ");
+      Serial.println(state);
+    }
+    // start listening again
+    int16_t state2 = radio.startReceive();
+    if (state2 == RADIOLIB_ERR_NONE) { 
+      //Serial.println("LoRa RX started");
+    } else {
+      Serial.print("LoRa RX failed, code ");
+      Serial.println(state2);
+    } 
+  }
 
+
+  // send struct every ~ 30s
+  int randomDelay = random(0,5000);
+  if (millis() - lastSend > 30000+randomDelay) {
+    Serial.println("Broadcasting struct...");
+    //broadcastStruct();
+    broadcastKIC();
+    lastSend = millis();
+  }
+//  // Send LoRa temp every 10s
+//  if (millis() - lastSend > 10000) {
+//    Serial.println("Broadcasting temp...");
+//    broadcastTemperature(myTemp);
+//    lastSend = millis();
+//  }
+
+//  // Heartbeat every 15s
+//  if (millis() - lastHeartbeat > 15000) {
+//    Serial.println("Broadcasting heartbeat...");
+//    broadcastHeartbeat();
+//    lastHeartbeat = millis();
+//  }
+}
+
+void processSerialCommands() {
   // Serial config (for debugging/config)
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
@@ -532,10 +856,17 @@ void loop() {
       struct tm t = {0};
       t.tm_year = y-1900; t.tm_mon = m-1; t.tm_mday = d; t.tm_hour = h; t.tm_min = mi; t.tm_sec = 0;
       time_t epoch = mktime(&t);
-      saveTime(epoch);
+//      saveTime(epoch);
       Serial.println("Time updated: " + String(epoch));
     }
   }
+
+}
+
+
+void loop() {
+  dnsServer.processNextRequest();
+  processSerialCommands();
 
   bool tempprobedisconnected = false;
   // Read DS18B20 every 5s
@@ -546,30 +877,13 @@ void loop() {
       myTemp = NAN;
       tempprobedisconnected = true;
     }
-    updateNodeTemp(nodeID, myTemp);
+    updateNodeTemp(nodeID, myTemp, NAN, NAN, doIhaveRTC);
     lastRead = millis();
     showOLED();
   }
 
-  // Send LoRa temp every 10s
-  if (millis() - lastSend > 10000) {
-    broadcastTemperature(myTemp);
-    lastSend = millis();
-  }
-  // Heartbeat every 15s
-  if (millis() - lastHeartbeat > 15000) {
-    broadcastHeartbeat();
-    lastHeartbeat = millis();
-  }
-
-  // Listen for LoRa packets
-  int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    String incoming = "";
-    while (LoRa.available())
-      incoming += (char)LoRa.read();
-    handleLoRaPacket(incoming);
-  }
+  radioloop();
+  logloop();
 
   // Node-down and checkin alarms
   bool silenceActive = millis() < silenceUntil;
@@ -579,7 +893,7 @@ void loop() {
     if (nid == nodeID) continue;
     bool found = false;
     for (auto& n : nodeTemps) {
-      if (n.id == nid && (millis() - n.lastUpdate < 30000)) found = true;
+      if (n.id == nid && (now() - n.lastUpdate < 300)) found = true;
     }
     if (!found && !silenceActive) {
       display.clearDisplay();

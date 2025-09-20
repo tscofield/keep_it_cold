@@ -13,12 +13,10 @@
 */
 
 #include <WiFi.h>
-//#include <WiFiManager.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
-//#include <LoRa.h>
 #include <RadioLib.h>
 #include <SPI.h>
 #include <Wire.h>
@@ -28,10 +26,10 @@
 #include <DallasTemperature.h>
 #include <vector>
 #include <Wire.h>
-//#include <RTClib.h>
 #include <TimeLib.h>
 #include <DS3231.h>
 #include <LittleFS.h>
+#include "CryptoHelper.h"
 
 // ----- Pin Definitions -----
 #define OLED_RESET 21
@@ -54,7 +52,6 @@ OneWire oneWire(DS18B20_PIN);
 DallasTemperature sensors(&oneWire);
 Preferences preferences;
 AsyncWebServer server(80);
-//WiFiManager wifiManager;
 DNSServer dnsServer;
 DS3231 rtc;
 
@@ -68,6 +65,32 @@ struct NodeTemp {
   time_t lastUpdate;
   bool hasrtc;
 };
+struct NodeConfig {
+  String id;
+  String name;
+  bool hasrtc;
+  time_t lastSeen;
+  String temp1_name;
+  String temp2_name;
+  String temp3_name;
+  bool temp1_enabled;
+  bool temp2_enabled;
+  bool temp3_enabled;
+  float temp1_alarm_low;
+  float temp1_alarm_high;
+  float temp2_alarm_low;
+  float temp2_alarm_high;
+  float temp3_alarm_low;
+  float temp3_alarm_high;
+};
+
+String loraPassphrase = "bowman#1";
+uint8_t loraKey[16];
+uint8_t loraIV[16] = {0};
+size_t encLen = 0;
+size_t decLen = 0;
+
+
 std::vector<NodeTemp> nodeTemps;
 String nodeID;
 String nodeList; // Comma-separated
@@ -241,6 +264,11 @@ void setLoraFlag(void) {
 }
 
 void setupLoRa() {
+  // generate encryption key
+  CryptoHelper::deriveKey(loraPassphrase, loraKey);
+
+
+
   Serial.println("SPI begin");
   //SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI);
@@ -271,36 +299,6 @@ void setupLoRa() {
   } 
 }
 
-void broadcastHeartbeat() {
-  String msg = nodeID + ",HEARTBEAT," + String(millis() / 1000);
-  int16_t state = radio.transmit(msg);
-  if(state == RADIOLIB_ERR_NONE){
-    Serial.println("Heartbeat sent: " + msg);
-  } else {
-    Serial.print("Heartbeat failed, code: ");
-    Serial.println(state);
-  }
-}
-
-void broadcastTemperature(float temp) {
-  String msg = nodeID + ",TEMP," + String(temp, 2);
-  int16_t state = radio.transmit(msg);
-  if(state == RADIOLIB_ERR_NONE){
-    Serial.println("Temperature sent: " + msg);
-  } else {
-    Serial.print("Temperature failed, code: ");
-    Serial.println(state);
-  }
-}
-//void broadcastStruct() {
-//  int16_t state = radio.transmit((uint8_t*)&myTemp, sizeof(myTemp));
-//  if(state == RADIOLIB_ERR_NONE){
-//    Serial.println("Struct sent");
-//  } else {
-//    Serial.print("Struct failed, code: ");
-//    Serial.println(state);
-//  }
-//}
 
 void broadcastNodeList() {
   String msg = "NODELIST," + nodeList;
@@ -336,9 +334,37 @@ void broadcastKIC() {
                String((unsigned long)nt->lastUpdate) + "," +
                String(nt->hasrtc ? 1 : 0);
   
-  int16_t state = radio.transmit(msg);
+  // Convert to bytes
+  size_t len = msg.length();
+  //size_t paddedLen = ((len + 15) / 16) * 16; // AES-CBC block padding
+  uint8_t input[len];
+  memcpy(input, msg.c_str(), len);
+
+  uint8_t output[256];
+  size_t outLen = 0;
+
+
+  //memset(input, 0, paddedLen);
+
+  // Encrypt
+  //CryptoHelper::aesEncrypt(loraKey, loraIV, input, paddedLen, output);
+  CryptoHelper::aesEncrypt(loraKey, input, len, output, outLen);
+
+  if (outLen == 0) {
+    Serial.println("Encryption failed, skipping send.");
+    return;
+  }
+
+  //int16_t state = radio.transmit(msg);
+  int16_t state = radio.transmit(output, outLen);
   if (state == RADIOLIB_ERR_NONE) {
-    Serial.println("NodeTemp sent: " + msg);
+    Serial.println("Send NodeTemp: " + msg);
+    Serial.print("Send Encrypted (hex): ");
+    for (size_t i = 0; i < outLen; i++) {
+      if (output[i] < 16) Serial.print("0");
+      Serial.print(output[i], HEX);
+    }
+    Serial.println();
   } else {
     Serial.print("Send failed: ");
     Serial.println(state);
@@ -779,14 +805,37 @@ unsigned long lastSend = 0, lastRead = 0, lastHeartbeat = 0;
 void radioloop() {
   if (loraPacketReceived) {
     loraPacketReceived = false;
-    String incoming = "";
-    int state = radio.readData(incoming);
+    uint8_t incoming[256];
+    int16_t len = radio.getPacketLength();
+    int16_t state = radio.readData(incoming, len);
 
     if (state == RADIOLIB_ERR_NONE) {
+      //size_t len = sizeof(incoming);
       // packet received successfully
-      Serial.println("Received: " + incoming);
-      Serial.println("Received length: " + String(incoming.length()));
-      handleLoRaPacket(incoming);
+      //Serial.println("Received: " + incoming);
+      Serial.println("Receive LoRa packet");
+      Serial.print("Receive Raw bytes: ");
+      for (int i = 0; i < len; i++) {
+        Serial.printf("%02X ", incoming[i]);
+      }
+      Serial.println();
+
+      //decrypt
+      uint8_t decrypted[256];
+      //CryptoHelper::aesDecrypt(loraKey, loraIV, incoming, len, decrypted);
+      CryptoHelper::aesDecrypt(loraKey, incoming, len, decrypted, decLen);
+
+      // Convert to String using known length
+      String msg = "";
+      unsigned int dlen = sizeof(decrypted);
+      for (int i = 0; i < dlen; i++) {
+        if (decrypted[i] == 0) break; // stop at null if there is one
+        msg += (char)decrypted[i];
+      }
+
+      Serial.println("Receive Decrypted msg: " + msg);
+      Serial.println("Receive length: " + String(msg.length()));
+      handleLoRaPacket(msg);
     } else {
       Serial.print("Receive failed, code: ");
       Serial.println(state);
@@ -796,7 +845,7 @@ void radioloop() {
     if (state2 == RADIOLIB_ERR_NONE) { 
       //Serial.println("LoRa RX started");
     } else {
-      Serial.print("LoRa RX failed, code ");
+      Serial.print("Receive LoRa RX failed, code ");
       Serial.println(state2);
     } 
   }
@@ -805,7 +854,7 @@ void radioloop() {
   // send struct every ~ 30s
   int randomDelay = random(0,5000);
   if (millis() - lastSend > 30000+randomDelay) {
-    Serial.println("Broadcasting struct...");
+    Serial.println("Sending Broadcasting struct...");
     //broadcastStruct();
     broadcastKIC();
     lastSend = millis();
